@@ -1,0 +1,1 @@
+worker: python3 trinity_signal_bot_production.py
