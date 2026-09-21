@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-TRINITY Signal Bot v3.0 - PRODUCTION (Polygon.io Data)
-======================================================
+TRINITY Signal Bot v3.0 - PRODUCTION (AlphaVantage Data)
+========================================================
 
 NQ futures signal bot for Discord.
-Uses Polygon.io for cloud-hosted real-time market data.
+Uses AlphaVantage for real-time market data.
 
 TRINITY:
     1. SWEEP
     2. CONFIRMATION
     3. ENTRY
 
-Designed for scheduled daily analysis plus manual Discord triggering.
-Deployed on Railway for 24/7 operation.
+Designed for 24/7 scanning and manual Discord triggering.
+Deployed on Railway for continuous operation.
 
 IMPORTANT:
 - This bot generates technical signals. It does not execute trades.
 - Backtest results are not guarantees of future performance.
-- Market data is sourced from Polygon.io (real-time futures data).
+- Market data is sourced from AlphaVantage (real-time data).
 """
 
 import os
@@ -32,9 +32,8 @@ import pandas as pd
 import numpy as np
 import pytz
 from dotenv import load_dotenv
-
-# Polygon API
 import requests
+import time
 
 # ============================================================
 # CONFIGURATION
@@ -44,7 +43,7 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
 
 SYMBOL = os.getenv("SYMBOL", "NQ=F")
 
@@ -81,9 +80,9 @@ SETUP_SCAN_BARS = 100
 STRUCTURE_LOOKBACK = 20
 MAX_SETUP_AGE_BARS = 12
 
-# Polygon API
-POLYGON_API_BASE = "https://api.polygon.io/v2"
-POLYGON_TIMEOUT = 30
+# AlphaVantage API
+ALPHAVANTAGE_API_BASE = "https://www.alphavantage.co/query"
+ALPHAVANTAGE_TIMEOUT = 30
 
 # ============================================================
 # LOGGING
@@ -156,65 +155,55 @@ class Signal:
 
 
 # ============================================================
-# POLYGON.IO DATA FETCHER
+# ALPHAVANTAGE DATA FETCHER
 # ============================================================
 
-class PolygonDataFetcher:
-    """Fetches real-time market data from Polygon.io"""
+class AlphaVantageDataFetcher:
+    """Fetches real-time market data from AlphaVantage"""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = POLYGON_API_BASE
+        self.base_url = ALPHAVANTAGE_API_BASE
         self.tz = TIMEZONE
 
-    def fetch_aggregates(
+    def fetch_intraday(
         self,
-        ticker: str,
-        timespan: str = "minute",
-        limit: int = 500
+        symbol: str,
+        interval: str = "1min",
+        limit: int = 100
     ) -> Optional[pd.DataFrame]:
         """
-        Fetch OHLCV data from Polygon.io
-
-        ticker: e.g., "NQ=F" (futures) or "AAPL" (stock)
-        timespan: "minute", "hour", "day", "week", "month", "quarter", "year"
-        limit: max 50000, but we want recent data so 500 is good
+        Fetch intraday data from AlphaVantage
+        
+        symbol: e.g., "NQ=F", "AAPL", "EUR/USD"
+        interval: "1min", "5min", "15min", "30min", "60min"
+        limit: number of recent candles to fetch
         """
 
         try:
             logger.info(
-                "Fetching %s (%s) from Polygon.io...",
-                ticker,
-                timespan
+                "Fetching %s (%s) from AlphaVantage...",
+                symbol,
+                interval
             )
-
-            # Construct URL
-            url = (
-                f"{self.base_url}/aggs/ticker/{ticker}/range/"
-                f"1/{timespan}"
-            )
-
-            # Calculate date range (last 30 days)
-            end_date = datetime.now(self.tz).date()
-            start_date = end_date - timedelta(days=30)
 
             params = {
-                "from": str(start_date),
-                "to": str(end_date),
-                "limit": limit,
-                "apiKey": self.api_key,
-                "sort": "asc"
+                "function": "TIME_SERIES_INTRADAY",
+                "symbol": symbol,
+                "interval": interval,
+                "apikey": self.api_key,
+                "outputsize": "full"
             }
 
             response = requests.get(
-                url,
+                self.base_url,
                 params=params,
-                timeout=POLYGON_TIMEOUT
+                timeout=ALPHAVANTAGE_TIMEOUT
             )
 
             if response.status_code != 200:
                 logger.error(
-                    "Polygon API error %d: %s",
+                    "AlphaVantage API error %d: %s",
                     response.status_code,
                     response.text
                 )
@@ -222,49 +211,86 @@ class PolygonDataFetcher:
 
             data = response.json()
 
-            if "results" not in data or not data["results"]:
-                logger.error("No data in Polygon response")
+            # Check for errors in response
+            if "Error Message" in data:
+                logger.error("AlphaVantage error: %s", data["Error Message"])
                 return None
 
-            # Convert to DataFrame
-            bars = data["results"]
+            if "Note" in data:
+                logger.warning("AlphaVantage rate limit: %s", data["Note"])
+                time.sleep(1)
+                return None
+
+            # Find the time series key
+            ts_key = None
+            for key in data.keys():
+                if key.startswith("Time Series"):
+                    ts_key = key
+                    break
+
+            if not ts_key or not data[ts_key]:
+                logger.error("No time series data in AlphaVantage response")
+                return None
+
+            # Parse the time series data
+            ts_data = data[ts_key]
+            timestamps = []
+            opens = []
+            highs = []
+            lows = []
+            closes = []
+            volumes = []
+
+            for timestamp_str, candle in list(ts_data.items())[:limit]:
+                try:
+                    timestamp = datetime.strptime(
+                        timestamp_str,
+                        "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=self.tz)
+                    
+                    timestamps.append(timestamp)
+                    opens.append(float(candle.get("1. open", 0)))
+                    highs.append(float(candle.get("2. high", 0)))
+                    lows.append(float(candle.get("3. low", 0)))
+                    closes.append(float(candle.get("4. close", 0)))
+                    volumes.append(float(candle.get("5. volume", 0)))
+                except (ValueError, KeyError):
+                    continue
+
+            if not timestamps:
+                logger.error("No valid candles parsed from AlphaVantage")
+                return None
 
             df = pd.DataFrame({
-                "timestamp": [
-                    datetime.fromtimestamp(
-                        bar["t"] / 1000,
-                        tz=self.tz
-                    )
-                    for bar in bars
-                ],
-                "Open": [bar.get("o", np.nan) for bar in bars],
-                "High": [bar.get("h", np.nan) for bar in bars],
-                "Low": [bar.get("l", np.nan) for bar in bars],
-                "Close": [bar.get("c", np.nan) for bar in bars],
-                "Volume": [bar.get("v", 0) for bar in bars],
+                "timestamp": timestamps,
+                "Open": opens,
+                "High": highs,
+                "Low": lows,
+                "Close": closes,
+                "Volume": volumes,
             })
 
             df.set_index("timestamp", inplace=True)
             df = df.sort_index()
 
             logger.info(
-                "Received %d candles from Polygon. "
+                "Received %d candles from AlphaVantage. "
                 "Range: %s to %s",
                 len(df),
-                df.index[0],
-                df.index[-1]
+                df.index[0] if len(df) > 0 else "N/A",
+                df.index[-1] if len(df) > 0 else "N/A"
             )
 
             return df
 
         except requests.exceptions.Timeout:
-            logger.error("Polygon API request timed out")
+            logger.error("AlphaVantage API request timed out")
             return None
         except requests.exceptions.ConnectionError as e:
             logger.error("Connection error: %s", e)
             return None
         except Exception as e:
-            logger.exception("Error fetching Polygon data: %s", e)
+            logger.exception("Error fetching AlphaVantage data: %s", e)
             return None
 
 
@@ -286,7 +312,7 @@ class TrinitySignalAnalyzer:
     a setup when the required conditions are not present.
     """
 
-    def __init__(self, data_fetcher: PolygonDataFetcher):
+    def __init__(self, data_fetcher: AlphaVantageDataFetcher):
         self.tz = TIMEZONE
         self.fetcher = data_fetcher
 
@@ -295,10 +321,10 @@ class TrinitySignalAnalyzer:
         symbol: str = SYMBOL,
     ) -> Optional[pd.DataFrame]:
 
-        df = self.fetcher.fetch_aggregates(
+        df = self.fetcher.fetch_intraday(
             symbol,
-            timespan="minute",
-            limit=500
+            interval="1min",
+            limit=100
         )
 
         if df is None or df.empty:
@@ -333,10 +359,7 @@ class TrinitySignalAnalyzer:
             )
             return None
 
-        # Remove duplicates
         df = df[~df.index.duplicated(keep="last")]
-
-        # Sort chronologically
         df = df.sort_index()
 
         logger.info(
@@ -400,7 +423,6 @@ class TrinitySignalAnalyzer:
         fvgs = []
         ifvgs = []
 
-        # Detect FVGs (gaps between candle closes/opens)
         for i in range(1, len(recent)):
             prev_candle = recent.iloc[i - 1]
             curr_candle = recent.iloc[i]
@@ -411,7 +433,6 @@ class TrinitySignalAnalyzer:
             curr_high = float(curr_candle["High"])
             curr_low = float(curr_candle["Low"])
 
-            # Bullish FVG (gap up)
             if curr_open > prev_high:
                 gap_low = prev_high
                 gap_high = curr_open
@@ -424,7 +445,6 @@ class TrinitySignalAnalyzer:
                     "age": len(recent) - i
                 })
 
-            # Bearish FVG (gap down)
             elif curr_high < prev_low:
                 gap_high = prev_low
                 gap_low = curr_high
@@ -437,26 +457,21 @@ class TrinitySignalAnalyzer:
                     "age": len(recent) - i
                 })
 
-        # Find nearest unmitigated FVG
         nearby_fvg = None
         for fvg in fvgs:
-            # Check if FVG has been hit/mitigated
             if fvg["type"] == "BULLISH":
-                # Bullish FVG: if price has touched it, it's mitigated
                 if current_price > fvg["high"]:
                     continue
-            else:  # BEARISH
-                # Bearish FVG: if price has touched it, it's mitigated
+            else:
                 if current_price < fvg["low"]:
                     continue
 
-            # This FVG is untouched/unmitigated
             if nearby_fvg is None:
                 nearby_fvg = fvg
                 break
 
         return {
-            "fvgs": fvgs[:5],  # Return up to 5 recent FVGs
+            "fvgs": fvgs[:5],
             "ifvgs": ifvgs,
             "nearby": nearby_fvg
         }
@@ -568,7 +583,6 @@ class TrinitySignalAnalyzer:
                 - float(candle["Low"])
             ) / candle_range
 
-            # Structure
             structure_start = max(0, i - STRUCTURE_LOOKBACK)
             prior = df.iloc[structure_start:i]
 
@@ -588,7 +602,6 @@ class TrinitySignalAnalyzer:
                 and candle["Close"] < prior_low
             )
 
-            # Displacement
             bullish_displacement = (
                 sweep.direction == "LONG"
                 and candle_range >= (
@@ -711,22 +724,18 @@ class TrinitySignalAnalyzer:
 
         score = 0
 
-        # Sweep quality
         score += 2
 
-        # Confirmation
         if confirmation.confirmation_type == "BOS + DISPLACEMENT":
             score += 3
         elif confirmation.confirmation_type in {"BOS", "DISPLACEMENT"}:
             score += 2
 
-        # Displacement quality
         if confirmation.atr_multiple >= 2.0:
             score += 2
         elif confirmation.atr_multiple >= 1.5:
             score += 1
 
-        # Price relationship
         if sweep.direction == "LONG":
             if current_price > sweep.sweep_level:
                 score += 1
@@ -857,7 +866,6 @@ class TrinitySignalAnalyzer:
             if risk_points <= 0:
                 continue
 
-            # Reject setups with stop loss > 25 points
             if risk_points > MAX_STOP_LOSS_POINTS:
                 logger.debug(
                     "Setup rejected: stop loss too wide "
@@ -898,7 +906,6 @@ class TrinitySignalAnalyzer:
 
             valid = confidence >= MIN_CONFIDENCE
 
-            # Detect FVGs for display (visual only, doesn't affect trading)
             fvg_info = self.detect_fvgs(df)
 
             candidate = Signal(
@@ -950,7 +957,6 @@ class TrinitySignalAnalyzer:
 
             return valid_candidates[0]
 
-        # Get FVG info for display
         fvg_info = self.detect_fvgs(df)
 
         return Signal(
@@ -1069,7 +1075,7 @@ class TrinitySignalAnalyzer:
 
 class TrinityBot(commands.Bot):
 
-    def __init__(self, data_fetcher: PolygonDataFetcher):
+    def __init__(self, data_fetcher: AlphaVantageDataFetcher):
 
         intents = discord.Intents.default()
         intents.message_content = True
@@ -1112,7 +1118,6 @@ class TrinityBot(commands.Bot):
     async def market_scanner(self):
         """Continuously scan for TRINITY setups 24/7 - unlimited signals"""
 
-        # Scan market for setups
         await self.check_for_signal()
 
     @market_scanner.before_loop
@@ -1187,7 +1192,6 @@ class TrinityBot(commands.Bot):
                 df
             )
 
-            # Only post if valid setup found
             if not signal.valid:
                 logger.debug(
                     "No valid setup: %s",
@@ -1302,9 +1306,9 @@ def validate_config():
             "CHANNEL_ID is missing."
         )
 
-    if not POLYGON_API_KEY:
+    if not ALPHAVANTAGE_API_KEY:
         errors.append(
-            "POLYGON_API_KEY is missing."
+            "ALPHAVANTAGE_API_KEY is missing."
         )
 
     if not 0 <= POST_HOUR <= 23:
@@ -1346,16 +1350,16 @@ async def main():
 
     validate_config()
 
-    polygon_fetcher = PolygonDataFetcher(
-        POLYGON_API_KEY
+    av_fetcher = AlphaVantageDataFetcher(
+        ALPHAVANTAGE_API_KEY
     )
 
-    bot = TrinityBot(polygon_fetcher)
+    bot = TrinityBot(av_fetcher)
 
     try:
 
         logger.info(
-            "🚀 TRINITY Signal Bot (Polygon.io) starting..."
+            "🚀 TRINITY Signal Bot (AlphaVantage) starting..."
         )
 
         logger.info(
